@@ -1,5 +1,8 @@
 require("dotenv").config();
 
+const os = require("os");
+const path = require("path");
+const { Worker } = require("worker_threads");
 const { ethers } = require("ethers");
 
 const RPC_URL = process.env.RPC_URL;
@@ -12,14 +15,24 @@ const ABI = [
   "function mine(uint256 nonce)"
 ];
 
-const WORKERS = 1;
+const CPU_CORES = os.cpus().length;
+const WORKERS = process.env.WORKERS
+  ? Math.min(Math.max(parseInt(process.env.WORKERS) || 1, 1), CPU_CORES)
+  : Math.max(1, CPU_CORES - 1);
 const STATS_UPDATE_MS = 1000;
-const HASH_BATCH = 100000n;
 
 let walletAddress = "";
 let globalStartTime = Date.now();
 let lastTxHash = "";
 let lastBlockNumber = 0;
+let processStartUsage = process.cpuUsage();
+
+const activeWorkers = [];
+const workerStats = new Map();
+let totalHashesGlobal = 0n;
+let roundStartTime = Date.now();
+let lastUpdate = Date.now();
+let pendingResolve = null;
 
 function requireEnv() {
   if (!RPC_URL || !PRIVATE_KEY) {
@@ -27,7 +40,6 @@ function requireEnv() {
     console.error("Contoh: cp .env.example .env lalu edit PRIVATE_KEY.");
     process.exit(1);
   }
-
   if (!PRIVATE_KEY.startsWith("0x")) {
     console.error("PRIVATE_KEY harus diawali 0x.");
     process.exit(1);
@@ -68,30 +80,38 @@ function formatNumber(n) {
 
 function estimateETA(difficulty, hps) {
   if (hps <= 0 || difficulty <= 0n) return "N/A";
-
   const LOG10_2_POW_256 = 77.06368;
   const diffStr = difficulty.toString();
   const log10Diff = (diffStr.length - 1) + Math.log10(parseInt(diffStr[0], 10));
   const log10Expected = LOG10_2_POW_256 - log10Diff;
   const log10ETA = log10Expected - Math.log10(hps);
   const etaSeconds = Math.pow(10, log10ETA);
-
   if (!isFinite(etaSeconds) || etaSeconds < 0) return "N/A";
   return "~" + formatTime(etaSeconds);
 }
 
-function renderStats({ era, reward, difficulty, epoch, challenge, totalHashes, startTime }) {
+function getCpuPercent() {
+  const usage = process.cpuUsage(processStartUsage);
+  const user = usage.user / 1000;
+  const sys = usage.system / 1000;
+  const elapsedMs = Date.now() - globalStartTime;
+  if (elapsedMs <= 0) return 0;
+  const percent = ((user + sys) / elapsedMs) * 100;
+  return Math.min(percent, 100 * CPU_CORES).toFixed(1);
+}
+
+function renderStats({ era, reward, difficulty, epoch, challenge }) {
   const elapsed = (Date.now() - globalStartTime) / 1000;
-  const roundElapsed = (Date.now() - startTime) / 1000;
-  const hps = roundElapsed > 0 ? Number(totalHashes) / roundElapsed : 0;
+  const roundElapsed = (Date.now() - roundStartTime) / 1000;
+  const hps = roundElapsed > 0 ? Number(totalHashesGlobal) / roundElapsed : 0;
   const eta = estimateETA(difficulty, hps);
   const challengeShort = challenge.length > 20
     ? challenge.slice(0, 10) + "..." + challenge.slice(-8)
     : challenge;
-
   const txInfo = lastTxHash
     ? `${lastTxHash.slice(0, 16)}... (block ${lastBlockNumber})`
     : "-";
+  const cpuPercent = getCpuPercent();
 
   return [
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -111,10 +131,13 @@ function renderStats({ era, reward, difficulty, epoch, challenge, totalHashes, s
     `  ${eta}`,
     "",
     `  hashes tried`,
-    `  ${formatNumber(totalHashes)}`,
+    `  ${formatNumber(totalHashesGlobal)}`,
     "",
     `  elapsed`,
     `  ${formatTime(elapsed)}`,
+    "",
+    `  cpu`,
+    `  ${cpuPercent}% / ${CPU_CORES} cores (${WORKERS} threads)`,
     "",
     `  challenge`,
     `  ${challengeShort}`,
@@ -125,18 +148,75 @@ function renderStats({ era, reward, difficulty, epoch, challenge, totalHashes, s
   ].join("\n");
 }
 
+function spawnWorkers(challenge, difficulty) {
+  pendingResolve = null;
+
+  for (let i = 0; i < WORKERS; i++) {
+    const worker = new Worker(path.join(__dirname, "worker.js"));
+    workerStats.set(i, 0n);
+
+    worker.on("message", (msg) => {
+      if (msg.type === "found") {
+        if (pendingResolve) {
+          pendingResolve(msg);
+          pendingResolve = null;
+        }
+      } else if (msg.type === "progress") {
+        workerStats.set(msg.workerId, BigInt(msg.totalHashes));
+        let total = 0n;
+        for (const h of workerStats.values()) {
+          total += h;
+        }
+        totalHashesGlobal = total;
+      } else if (msg.type === "stopped") {
+        workerStats.set(msg.workerId, BigInt(msg.totalHashes));
+      }
+    });
+
+    worker.on("error", (err) => {
+      console.error(`Worker ${i} error:`, err.message);
+    });
+
+    worker.on("exit", (code) => {
+      if (code !== 0) {
+        console.error(`Worker ${i} exited with code ${code}`);
+      }
+    });
+
+    worker.postMessage({
+      type: "start",
+      challenge,
+      difficulty: difficulty.toString(),
+      startNonce: randomNonce().toString(),
+      workerId: i
+    });
+
+    activeWorkers.push(worker);
+  }
+}
+
+function stopAllWorkers() {
+  activeWorkers.forEach((w) => w.postMessage({ type: "stop" }));
+  setTimeout(() => {
+    while (activeWorkers.length > 0) {
+      const w = activeWorkers.pop();
+      w.terminate();
+    }
+  }, 800);
+}
+
 async function main() {
   requireEnv();
 
   const provider = new ethers.JsonRpcProvider(RPC_URL);
   const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
   const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, wallet);
-
   walletAddress = wallet.address;
 
   console.log("HASH256 CLI Miner initialized");
-  console.log("Wallet:", walletAddress);
-  console.log("Contract:", CONTRACT_ADDRESS);
+  console.log(`Wallet: ${walletAddress}`);
+  console.log(`Contract: ${CONTRACT_ADDRESS}`);
+  console.log(`CPU: ${CPU_CORES} cores detected, using ${WORKERS} workers\n`);
   console.log("Starting mining...\n");
 
   while (true) {
@@ -147,7 +227,7 @@ async function main() {
       challenge = await contract.getChallenge(wallet.address);
     } catch (err) {
       console.error("Failed to fetch mining state:", err.shortMessage || err.message);
-      await new Promise(r => setTimeout(r, 5000));
+      await new Promise((r) => setTimeout(r, 5000));
       continue;
     }
 
@@ -155,79 +235,56 @@ async function main() {
     const era = state.era.toString();
     const epoch = state.epoch.toString();
 
-    let nonce = randomNonce();
-    let totalHashes = 0n;
-    const roundStartTime = Date.now();
-    let challengeStaleCount = 0;
-    let lastUpdate = Date.now();
+    roundStartTime = Date.now();
+    totalHashesGlobal = 0n;
+    workerStats.clear();
+    lastUpdate = Date.now();
 
-    while (true) {
-      const hash = ethers.solidityPackedKeccak256(
-        ["bytes32", "uint256"],
-        [challenge, nonce]
-      );
+    spawnWorkers(challenge, difficulty);
 
-      const hashNum = BigInt(hash);
-      totalHashes++;
-
-      if (hashNum < difficulty) {
+    const statsInterval = setInterval(() => {
+      const now = Date.now();
+      if (now - lastUpdate >= STATS_UPDATE_MS) {
         process.stdout.write("\x1Bc");
-        console.log(renderStats({ era, reward, difficulty, epoch, challenge, totalHashes, startTime: roundStartTime }));
-        console.log("\n  FOUND nonce:", nonce.toString());
-        console.log("  Hash:", hash);
-
-        try {
-          const tx = await contract.mine(nonce, {
-            gasLimit: 300000
-          });
-          lastTxHash = tx.hash;
-          console.log("  TX sent:", tx.hash);
-
-          const receipt = await tx.wait();
-          lastBlockNumber = receipt.blockNumber;
-          console.log("  Success block:", receipt.blockNumber);
-        } catch (err) {
-          console.error("  TX failed:", err.shortMessage || err.message);
-          lastTxHash = "";
-          lastBlockNumber = 0;
-        }
-
-        console.log("\n  Starting new round...\n");
-        await new Promise(r => setTimeout(r, 2000));
-        break;
+        console.log(renderStats({ era, reward, difficulty, epoch, challenge }));
+        lastUpdate = now;
       }
+    }, STATS_UPDATE_MS);
 
-      nonce++;
+    const result = await new Promise((resolve) => {
+      pendingResolve = resolve;
+    });
 
-      if (nonce % HASH_BATCH === 0n) {
-        const now = Date.now();
+    clearInterval(statsInterval);
+    stopAllWorkers();
 
-        if (now - lastUpdate >= STATS_UPDATE_MS) {
-          process.stdout.write("\x1Bc");
-          console.log(renderStats({ era, reward, difficulty, epoch, challenge, totalHashes, startTime: roundStartTime }));
-          lastUpdate = now;
-        }
+    process.stdout.write("\x1Bc");
+    console.log(renderStats({ era, reward, difficulty, epoch, challenge }));
+    console.log(`\n  FOUND by worker ${result.workerId}!`);
+    console.log("  Nonce:", result.nonce);
+    console.log("  Hash:", result.hash);
 
-        challengeStaleCount++;
-        if (challengeStaleCount >= 60) {
-          challengeStaleCount = 0;
-          try {
-            const freshChallenge = await contract.getChallenge(wallet.address);
-            if (freshChallenge !== challenge) {
-              console.log("\n  Challenge changed, restarting round...");
-              challenge = freshChallenge;
-              nonce = randomNonce();
-              totalHashes = 0n;
-            }
-          } catch (e) {}
-        }
-      }
+    try {
+      const tx = await contract.mine(result.nonce, { gasLimit: 300000 });
+      lastTxHash = tx.hash;
+      console.log("  TX sent:", tx.hash);
+      const receipt = await tx.wait();
+      lastBlockNumber = receipt.blockNumber;
+      console.log("  Success block:", receipt.blockNumber);
+    } catch (err) {
+      console.error("  TX failed:", err.shortMessage || err.message);
+      lastTxHash = "";
+      lastBlockNumber = 0;
     }
+
+    console.log("\n  Starting new round...\n");
+    await new Promise((r) => setTimeout(r, 2000));
   }
 }
 
 process.on("SIGINT", () => {
   console.log("\n\nMiner stopped.");
+  stopAllWorkers();
   process.exit(0);
 });
 

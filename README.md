@@ -70,6 +70,8 @@ Isi `.env`:
 ```env
 RPC_URL=https://ethereum-rpc.publicnode.com
 PRIVATE_KEY=0xPRIVATE_KEY_WALLET_KAMU
+# Optional: set worker threads (default = CPU cores - 1)
+WORKERS=4
 ```
 
 Simpan di nano:
@@ -97,19 +99,43 @@ npm start
 Contoh output:
 
 ```text
-Wallet: 0x....
-Contract: 0xAC7b5d06fa1e77D08aea40d46cB7C5923A87A0cc
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  HASH256 CLI Miner
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Wallet:   0x...
+  Contract: 0xAC7b...A0cc
 
-Era: ...
-Reward: ... HASH
-Difficulty: ...
-Epoch: ...
-Challenge: 0x...
-........
-FOUND nonce: ...
-Hash: 0x...
-TX sent: 0x...
-Success block: ...
+  Era:      1
+  Reward:   100.0 HASH
+  Epoch:    42
+
+  hashrate
+  58.2 MH/s x 4 workers
+
+  ETA - current diff
+  ~1.2h
+
+  hashes tried
+  5,640,500,000
+
+  elapsed
+  594.9 s
+
+  cpu
+  85.4% / 8 cores (4 threads)
+
+  challenge
+  0x66489cfc...e41a63
+
+  tx
+  -
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  FOUND by worker 2!
+  Nonce: 12345678901234567890
+  Hash: 0x0000...
+  TX sent: 0x...
+  Success block: 12345678
 ```
 
 ## Error Umum
@@ -164,3 +190,31 @@ Nonce yang ditemukan tidak memenuhi difficulty saat transaksi diproses. Jalankan
 ### `GenesisNotComplete`
 
 Mining belum dibuka oleh kontrak. Tunggu sampai genesis selesai.
+
+## Konfigurasi Worker / CPU
+
+Miner akan otomatis deteksi jumlah CPU core dan pakai `(cores - 1)` threads.
+
+**Cek CPU yang terdeteksi:**
+
+```bash
+node -e "console.log(require('os').cpus().length + ' cores')"
+```
+
+**Atur manual jumlah worker di `.env`:**
+
+```env
+# Pakai semua core
+WORKERS=8
+
+# Pakai setengah core
+WORKERS=4
+
+# Single thread (mode hemat)
+WORKERS=1
+```
+
+**Tips:**
+- Kalau VPS murah / shared: pakai `WORKERS=1` atau `WORKERS=2`
+- Kalau dedicated server: pakai `WORKERS=(cores - 1)`
+- Jangan pakai `WORKERS` lebih dari jumlah CPU core
