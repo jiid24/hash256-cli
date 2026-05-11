@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const os = require("os");
 const path = require("path");
+const fs = require("fs");
 const { Worker } = require("worker_threads");
 const { ethers } = require("ethers");
 
@@ -23,12 +24,14 @@ const WORKERS = process.env.WORKERS
   ? Math.min(Math.max(parseInt(process.env.WORKERS) || 1, 1), CPU_CORES)
   : Math.max(1, CPU_CORES - 1);
 const STATS_UPDATE_MS = 1000;
+const TX_HISTORY_FILE = path.join(__dirname, "tx_history.json");
 
 let walletAddress = "";
 let globalStartTime = Date.now();
 let lastTxHash = "";
 let lastBlockNumber = 0;
 let processStartUsage = process.cpuUsage();
+let txHistory = [];
 
 const activeWorkers = [];
 const workerStats = new Map();
@@ -48,6 +51,38 @@ function requireEnv() {
     console.error("PRIVATE_KEY harus diawali 0x.");
     process.exit(1);
   }
+}
+
+function loadTxHistory() {
+  try {
+    if (fs.existsSync(TX_HISTORY_FILE)) {
+      const data = fs.readFileSync(TX_HISTORY_FILE, "utf8");
+      txHistory = JSON.parse(data);
+      console.log(`Loaded ${txHistory.length} transactions from history`);
+    }
+  } catch (err) {
+    console.error("Failed to load tx history:", err.message);
+    txHistory = [];
+  }
+}
+
+function saveTxHistory() {
+  try {
+    fs.writeFileSync(TX_HISTORY_FILE, JSON.stringify(txHistory, null, 2));
+  } catch (err) {
+    console.error("Failed to save tx history:", err.message);
+  }
+}
+
+function addTxRecord(txHash, blockNumber, reward) {
+  const record = {
+    txHash,
+    blockNumber,
+    reward,
+    timestamp: new Date().toISOString()
+  };
+  txHistory.push(record);
+  saveTxHistory();
 }
 
 function randomNonce() {
@@ -232,6 +267,7 @@ function stopAllWorkers() {
 
 async function main() {
   requireEnv();
+  loadTxHistory();
 
   const provider = new ethers.JsonRpcProvider(RPC_URL);
   const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
@@ -322,6 +358,7 @@ async function main() {
       const receipt = await tx.wait();
       lastBlockNumber = receipt.blockNumber;
       console.log("  Success block:", receipt.blockNumber);
+      addTxRecord(tx.hash, receipt.blockNumber, reward);
     } catch (err) {
       console.error("  TX failed:", err.shortMessage || err.message);
       lastTxHash = "";
