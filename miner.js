@@ -36,6 +36,7 @@ let totalHashesGlobal = 0n;
 let roundStartTime = Date.now();
 let lastUpdate = Date.now();
 let pendingResolve = null;
+let totalHashClaimed = 0;
 
 function requireEnv() {
   if (!RPC_URL || !PRIVATE_KEY) {
@@ -115,6 +116,7 @@ function renderStats({ era, reward, difficulty, epoch, challenge }) {
     ? `${lastTxHash.slice(0, 16)}... (block ${lastBlockNumber})`
     : "-";
   const cpuPercent = Math.min(parseFloat(getCpuPercent()) / CPU_CORES, 100).toFixed(1);
+  const claimedStr = totalHashClaimed > 0 ? `${totalHashClaimed.toFixed(2)} HASH` : "-";
 
   return [
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -141,6 +143,9 @@ function renderStats({ era, reward, difficulty, epoch, challenge }) {
     "",
     `  cpu`,
     `  ${cpuPercent}% / ${CPU_CORES} cores (${WORKERS} threads)`,
+    "",
+    `  claimed`,
+    `  ${claimedStr}`,
     "",
     `  challenge`,
     `  ${challengeShort}`,
@@ -312,6 +317,7 @@ async function main() {
       const gasOpts = await getGasSettings(provider);
       const tx = await contract.mine(result.nonce, gasOpts);
       lastTxHash = tx.hash;
+      totalHashClaimed += parseFloat(reward);
       console.log("  TX sent:", tx.hash);
       const receipt = await tx.wait();
       lastBlockNumber = receipt.blockNumber;
