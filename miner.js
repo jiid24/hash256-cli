@@ -15,6 +15,9 @@ const ABI = [
   "function mine(uint256 nonce)"
 ];
 
+const CHALLENGE_POLL_MS = 15000;
+const NONCE_PARTITION = 2n ** 64n;
+
 const CPU_CORES = os.cpus().length;
 const WORKERS = process.env.WORKERS
   ? Math.min(Math.max(parseInt(process.env.WORKERS) || 1, 1), CPU_CORES)
@@ -183,16 +186,33 @@ function spawnWorkers(challenge, difficulty) {
       }
     });
 
+    // Partition nonce space per worker to avoid overlap
+    const startNonce = (NONCE_PARTITION * BigInt(i)) + randomNonce();
+
     worker.postMessage({
       type: "start",
       challenge,
       difficulty: difficulty.toString(),
-      startNonce: randomNonce().toString(),
+      startNonce: startNonce.toString(),
       workerId: i
     });
 
     activeWorkers.push(worker);
   }
+}
+
+async function getGasSettings(provider) {
+  try {
+    const feeData = await provider.getFeeData();
+    if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
+      return {
+        maxFeePerGas: feeData.maxFeePerGas,
+        maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
+        gasLimit: 300000
+      };
+    }
+  } catch (e) {}
+  return { gasLimit: 300000 };
 }
 
 function stopAllWorkers() {
@@ -251,12 +271,36 @@ async function main() {
       }
     }, STATS_UPDATE_MS);
 
+    // Poll for challenge/epoch changes during mining
+    let challengeChanged = false;
+    const challengePoll = setInterval(async () => {
+      try {
+        const freshChallenge = await contract.getChallenge(wallet.address);
+        if (freshChallenge !== challenge) {
+          challengeChanged = true;
+          console.log("\n  Epoch changed, restarting workers...");
+          stopAllWorkers();
+          if (pendingResolve) {
+            pendingResolve({ type: "epochChange" });
+            pendingResolve = null;
+          }
+        }
+      } catch (e) {}
+    }, CHALLENGE_POLL_MS);
+
     const result = await new Promise((resolve) => {
       pendingResolve = resolve;
     });
 
     clearInterval(statsInterval);
+    clearInterval(challengePoll);
     stopAllWorkers();
+
+    if (result.type === "epochChange") {
+      console.log("  Restarting with new challenge...\n");
+      await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
 
     process.stdout.write("\x1Bc");
     console.log(renderStats({ era, reward, difficulty, epoch, challenge }));
@@ -265,7 +309,8 @@ async function main() {
     console.log("  Hash:", result.hash);
 
     try {
-      const tx = await contract.mine(result.nonce, { gasLimit: 300000 });
+      const gasOpts = await getGasSettings(provider);
+      const tx = await contract.mine(result.nonce, gasOpts);
       lastTxHash = tx.hash;
       console.log("  TX sent:", tx.hash);
       const receipt = await tx.wait();
