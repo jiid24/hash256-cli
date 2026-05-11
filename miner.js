@@ -111,7 +111,7 @@ function renderStats({ era, reward, difficulty, epoch, challenge }) {
   const txInfo = lastTxHash
     ? `${lastTxHash.slice(0, 16)}... (block ${lastBlockNumber})`
     : "-";
-  const cpuPercent = getCpuPercent();
+  const cpuPercent = Math.min(parseFloat(getCpuPercent()) / CPU_CORES, 100).toFixed(1);
 
   return [
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
