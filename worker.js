@@ -8,8 +8,8 @@ let nonce = 0n;
 let totalHashes = 0n;
 let workerId = 0;
 
-const BATCH = 50_000;
-const REPORT_EVERY = 10_000;
+const BATCH = 10_000;
+const REPORT_EVERY = 5_000;
 
 parentPort.on("message", (msg) => {
   if (msg.type === "start") {
@@ -25,14 +25,6 @@ parentPort.on("message", (msg) => {
   }
 });
 
-function fastKeccak(challengeHex, nonceVal) {
-  // Equivalent to solidityPackedKeccak256(["bytes32","uint256"],[challenge,nonce])
-  // abi.encodePacked(bytes32, uint256) = 32 bytes challenge + 32 bytes uint256 BE
-  const nHex = nonceVal.toString(16).padStart(64, "0");
-  const packed = challengeHex.slice(2) + nHex;
-  return ethers.keccak256("0x" + packed);
-}
-
 function mineLoop() {
   if (stopped) {
     parentPort.postMessage({
@@ -44,7 +36,11 @@ function mineLoop() {
   }
 
   for (let i = 0; i < BATCH; i++) {
-    const hash = fastKeccak(challenge, nonce);
+    // ethers.solidityPackedKeccak256 uses internal @noble/hashes (optimized)
+    const hash = ethers.solidityPackedKeccak256(
+      ["bytes32", "uint256"],
+      [challenge, nonce]
+    );
     totalHashes++;
 
     if (BigInt(hash) < difficulty) {
